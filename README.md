@@ -28,9 +28,6 @@ Este MCP existe para um caso de uso específico: dar a uma IA generativa uma fon
 
 O servidor usa o transporte Streamable HTTP e roda na nuvem, na Vercel, no URL `https://remote-mcp-g1.vercel.app/mcp`.
 
-> [!NOTE]
-> Esse URL é um espaço reservado até o deploy na Vercel ser concluído. Depois do deploy, atualize esse endereço em todo este README.
-
 > [!IMPORTANT]
 > Esse URL só aceita pedidos `POST` e `DELETE`, no formato do protocolo MCP. Se você colar o URL no navegador, ele faz um pedido `GET` e mostra a mensagem "Method Not Allowed". Isso é esperado, não é um erro. Confirma só que o servidor está no ar. Use o URL dentro de um cliente MCP, não direto no navegador.
 
