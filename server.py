@@ -4,6 +4,7 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -14,6 +15,8 @@ from starlette.middleware.cors import CORSMiddleware
 
 # Cria o servidor MCP
 mcp = FastMCP("G1-Noticias")
+
+_DATA_MUITO_ANTIGA = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 # --- Modelos -----------------------------------------------------------
@@ -29,6 +32,24 @@ class Editoria:
     chave: str
     nome: str
     url: str
+
+    def url_da_pagina(self, pagina: int) -> str:
+        """Monta o URL de listagem da editoria; a página 1 é o URL normal,
+        as seguintes usam a paginação "index/feed" do G1 (confirmada em
+        teste manual: cada página traz 10 notícias mais antigas que a anterior)."""
+        if pagina <= 1:
+            return self.url
+        return f"{self.url}index/feed/pagina-{pagina}.ghtml"
+
+    def pertence(self, url_noticia: str) -> bool:
+        """Confere se um link encontrado na listagem é mesmo desta editoria.
+
+        As páginas de listagem do G1 também têm blocos de "veja também" e
+        matérias relacionadas, com a mesma marcação HTML das notícias da
+        editoria, mas apontando para outras seções do site. Sem esse filtro,
+        a tool arrisca devolver uma notícia fora do escopo combinado.
+        """
+        return url_noticia.startswith(self.url)
 
 
 @dataclass(frozen=True)
@@ -47,6 +68,7 @@ class MateriaG1:
     titulo: str
     subtitulo: str
     paragrafos: list[str]
+    publicado_em: Optional[datetime]
 
 
 # --- Editorias permitidas ------------------------------------------------
@@ -74,6 +96,16 @@ EDITORIAS_PADRAO = [
 ]
 
 
+class NormalizadorTexto:
+    """Remove acentos e caixa alta, para comparar texto de forma tolerante
+    a variação. Usado tanto para casar a chave de editoria quanto o tema."""
+
+    @staticmethod
+    def normalizar(texto: str) -> str:
+        sem_acento = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
+        return sem_acento.lower()
+
+
 class RegistroEditorias:
     """Guarda as editorias permitidas e resolve o parâmetro `editoria` da tool."""
 
@@ -98,10 +130,59 @@ class RegistroEditorias:
     def _normalizar_chave(texto: str) -> str:
         # Aceita variações como "Pop & Arte" ou "fato ou fake" e converte
         # para a mesma chave usada internamente (ex: "pop-arte").
-        sem_acento = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
-        minusculo = sem_acento.strip().lower().replace(" ", "-")
+        minusculo = NormalizadorTexto.normalizar(texto).strip().replace(" ", "-")
         somente_validos = re.sub(r"[^a-z0-9-]", "", minusculo)
         return re.sub(r"-+", "-", somente_validos).strip("-")
+
+
+class GeradorPalavrasChave:
+    """Amplia o tema de busca em até 10 variações (plural/singular e um
+    radical curto de cada palavra), para não depender só do termo exato.
+
+    Ex: tema "vacina" também casa com "vacinas", "vacinação", "vacinal" —
+    porque o radical "vacin" fica entre as variações geradas.
+    """
+
+    _MAXIMO_VARIACOES = 10
+    _TAMANHO_RADICAL = 5
+
+    def gerar(self, tema: str) -> list[str]:
+        normalizado = NormalizadorTexto.normalizar(tema)
+        palavras = normalizado.split()
+        significativas = [palavra for palavra in palavras if len(palavra) >= 3] or palavras
+
+        variacoes: list[str] = []
+        for palavra in significativas:
+            self._adicionar(variacoes, palavra)
+            self._adicionar(variacoes, self._variar_plural(palavra))
+            self._adicionar(variacoes, palavra[: self._TAMANHO_RADICAL])
+            if len(variacoes) >= self._MAXIMO_VARIACOES:
+                break
+
+        return variacoes[: self._MAXIMO_VARIACOES]
+
+    @staticmethod
+    def _adicionar(lista: list[str], palavra: str) -> None:
+        if palavra and palavra not in lista:
+            lista.append(palavra)
+
+    @staticmethod
+    def _variar_plural(palavra: str) -> str:
+        if palavra.endswith("s") and len(palavra) > 4:
+            return palavra[:-1]
+        return palavra + "s"
+
+
+class FiltroPorTema:
+    """Decide se uma notícia da listagem tem relação com o tema pesquisado,
+    usando as variações de palavra-chave geradas por GeradorPalavrasChave."""
+
+    def __init__(self, tema: str, gerador_palavras_chave: GeradorPalavrasChave) -> None:
+        self._palavras_chave = gerador_palavras_chave.gerar(tema)
+
+    def combina(self, item: ItemNoticia) -> bool:
+        texto = NormalizadorTexto.normalizar(f"{item.titulo} {item.chamada}")
+        return any(palavra in texto for palavra in self._palavras_chave)
 
 
 # --- Acesso HTTP ----------------------------------------------------------
@@ -174,11 +255,12 @@ class ExtratorListagemG1:
 
 
 class ExtratorMateriaG1:
-    """Extrai título, subtítulo e parágrafos do corpo de uma matéria do G1."""
+    """Extrai título, subtítulo, parágrafos e data de publicação de uma matéria do G1."""
 
     _TITULO_RE = re.compile(r'<h1 class="content-head__title"[^>]*>(.*?)</h1>', re.DOTALL)
     _SUBTITULO_RE = re.compile(r'<meta itemprop="alternateName" content="([^"]*)"')
     _PARAGRAFO_RE = re.compile(r'<p class="[^"]*content-text__container[^"]*"[^>]*>(.*?)</p>', re.DOTALL)
+    _DATA_PUBLICACAO_RE = re.compile(r'<meta itemprop="datePublished" content="([^"]+)"')
 
     def __init__(self, limpador: LimpadorHtml) -> None:
         self._limpador = limpador
@@ -193,7 +275,20 @@ class ExtratorMateriaG1:
             titulo=self._limpador.limpar(titulo_match.group(1)),
             subtitulo=self._limpador.limpar(subtitulo_match.group(1)) if subtitulo_match else "",
             paragrafos=[p for p in paragrafos if p],
+            publicado_em=self._extrair_data(html_pagina),
         )
+
+    def _extrair_data(self, html_pagina: str) -> Optional[datetime]:
+        # A primeira ocorrência do meta datePublished é sempre a da matéria
+        # em si; ocorrências seguintes podem pertencer a vídeos embutidos no
+        # corpo do texto, com data própria diferente da publicação da matéria.
+        data_match = self._DATA_PUBLICACAO_RE.search(html_pagina)
+        if data_match is None:
+            return None
+        try:
+            return datetime.fromisoformat(data_match.group(1))
+        except ValueError:
+            return None
 
 
 class MontadorResumo:
@@ -217,27 +312,19 @@ class MontadorResumo:
         return resumo
 
 
-class FiltroPorTema:
-    """Decide se uma notícia da listagem tem relação com o tema pesquisado."""
+class FormatadorData:
+    """Formata a data de publicação para exibição, no padrão dd/mm/aaaa HHhMM."""
 
-    def __init__(self, tema: str) -> None:
-        todas_as_palavras = self._normalizar(tema).split()
-        significativas = [palavra for palavra in todas_as_palavras if len(palavra) >= 3]
-        self._palavras_chave = significativas or todas_as_palavras
-
-    def combina(self, item: ItemNoticia) -> bool:
-        texto = self._normalizar(f"{item.titulo} {item.chamada}")
-        return any(palavra in texto for palavra in self._palavras_chave)
-
-    @staticmethod
-    def _normalizar(texto: str) -> str:
-        sem_acento = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
-        return sem_acento.lower()
+    def formatar(self, publicado_em: Optional[datetime]) -> str:
+        if publicado_em is None:
+            return "data não disponível"
+        return publicado_em.strftime("%d/%m/%Y %Hh%M")
 
 
 class CacheListagem:
-    """Cache em memória, por editoria, com TTL — evita varrer as 16 páginas
-    do G1 a cada chamada. 10 minutos é o mesmo padrão usado no mcp-sofiasa."""
+    """Cache em memória, por editoria e página, com TTL — evita varrer as
+    páginas do G1 de novo a cada chamada. 10 minutos é o mesmo padrão usado
+    no mcp-sofiasa."""
 
     def __init__(self, ttl_segundos: int = 600) -> None:
         self._ttl_segundos = ttl_segundos
@@ -257,8 +344,18 @@ class CacheListagem:
 
 
 class BuscadorNoticiasG1:
-    """Orquestra a busca: escolhe as editorias, filtra pelo tema, busca cada
-    matéria candidata e monta o texto final devolvido pela tool."""
+    """Orquestra a busca: escolhe as editorias, pagina até achar candidatos
+    suficientes, busca cada matéria candidata, ordena por data de publicação
+    real e monta o texto final devolvido pela tool.
+
+    A busca sempre tenta entregar `quantidade` notícias (padrão e mínimo
+    esperado: 3). Para isso, ela não para na primeira página de cada
+    editoria: se os candidatos encontrados na página 1 não forem
+    suficientes, ela busca a página 2, depois a 3, e assim por diante, até
+    `max_paginas` ou até o orçamento de tempo se esgotar. Isso cobre temas
+    cuja notícia mais recente não está no topo da editoria (ex: um assunto
+    de nicho, como turismo ou loterias, que publica com menos frequência).
+    """
 
     def __init__(
         self,
@@ -267,14 +364,22 @@ class BuscadorNoticiasG1:
         extrator_listagem: ExtratorListagemG1,
         extrator_materia: ExtratorMateriaG1,
         montador_resumo: MontadorResumo,
+        formatador_data: FormatadorData,
         cache: CacheListagem,
+        max_paginas: int = 5,
+        orcamento_segundos: float = 25.0,
+        concorrencia_maxima: int = 8,
     ) -> None:
         self._registro_editorias = registro_editorias
         self._cliente_http = cliente_http
         self._extrator_listagem = extrator_listagem
         self._extrator_materia = extrator_materia
         self._montador_resumo = montador_resumo
+        self._formatador_data = formatador_data
         self._cache = cache
+        self._max_paginas = max_paginas
+        self._orcamento_segundos = orcamento_segundos
+        self._concorrencia_maxima = concorrencia_maxima
 
     async def buscar(self, tema: str, editoria: str = "", quantidade: int = 3) -> str:
         tema = tema.strip()
@@ -291,58 +396,138 @@ class BuscadorNoticiasG1:
         else:
             editorias_alvo = self._registro_editorias.todas
 
+        filtro = FiltroPorTema(tema, GeradorPalavrasChave())
+
         async with httpx.AsyncClient() as cliente:
-            listas = await asyncio.gather(
-                *(self._itens_da_editoria(cliente, editoria_alvo) for editoria_alvo in editorias_alvo)
-            )
-            candidatos = [item for lista in listas for item in lista]
+            resolvidos, houve_candidato = await self._buscar_resolvidos(cliente, editorias_alvo, filtro, quantidade)
 
-            filtro = FiltroPorTema(tema)
-            correspondentes = [item for item in candidatos if filtro.combina(item)]
-
-            if not correspondentes:
+        if not resolvidos:
+            if houve_candidato:
                 return (
-                    f"Não foram encontradas notícias sobre '{tema}' nas editorias do G1 "
-                    "permitidas para busca. Tente um tema mais amplo, ou use a tool "
-                    "g1_listar_editorias para ver as editorias disponíveis."
+                    f"Notícias sobre '{tema}' foram encontradas no G1, mas não foi possível "
+                    "acessar o conteúdo completo agora. Tente novamente em instantes."
                 )
-
-            resultados: list[tuple[ItemNoticia, str]] = []
-            for item in correspondentes:
-                if len(resultados) >= quantidade:
-                    break
-                resumo = await self._resumo_da_materia(cliente, item.url)
-                if resumo:
-                    resultados.append((item, resumo))
-
-        if not resultados:
             return (
-                f"Notícias sobre '{tema}' foram encontradas no G1, mas não foi possível "
-                "acessar o conteúdo completo agora. Tente novamente em instantes."
+                f"Não foram encontradas notícias sobre '{tema}' nas editorias do G1 "
+                "permitidas para busca, mesmo vasculhando várias páginas de cada "
+                "editoria. Tente um tema mais amplo, ou use a tool g1_listar_editorias "
+                "para ver as editorias disponíveis."
             )
 
-        blocos = [f"Notícias do G1 sobre '{tema}':\n"]
-        for indice, (item, resumo) in enumerate(resultados, start=1):
-            blocos.append(f"{indice}. {item.titulo}\nResumo: {resumo}\nLink: {item.url}\n")
+        resolvidos.sort(key=lambda resolvido: resolvido[1].publicado_em or _DATA_MUITO_ANTIGA, reverse=True)
+        selecionados = resolvidos[:quantidade]
+        return self._formatar_resposta(tema, quantidade, selecionados)
+
+    async def _buscar_resolvidos(
+        self,
+        cliente: httpx.AsyncClient,
+        editorias_alvo: list[Editoria],
+        filtro: FiltroPorTema,
+        quantidade: int,
+    ) -> tuple[list[tuple[ItemNoticia, MateriaG1, str]], bool]:
+        """Varre página a página, resolvendo cada candidata encontrada, até
+        ter `quantidade` notícias resolvidas de verdade — não apenas
+        candidatas brutas. Continuar paginando enquanto faltar é o que
+        garante a entrega das 3 notícias mesmo quando algumas candidatas
+        falham ao carregar (o resultado final é sempre baseado no que
+        realmente carregou, nunca numa contagem otimista de candidatas)."""
+        resolvidos: list[tuple[ItemNoticia, MateriaG1, str]] = []
+        urls_vistas: set[str] = set()
+        houve_candidato = False
+        inicio = time.monotonic()
+
+        for pagina in range(1, self._max_paginas + 1):
+            listas = await asyncio.gather(
+                *(self._itens_da_pagina(cliente, editoria_alvo, pagina) for editoria_alvo in editorias_alvo)
+            )
+            novos = []
+            for lista in listas:
+                for item in lista:
+                    if item.url not in urls_vistas and filtro.combina(item):
+                        urls_vistas.add(item.url)
+                        novos.append(item)
+
+            if novos:
+                houve_candidato = True
+                # Só resolve o necessário para cobrir o que falta (com uma
+                # folga de 3x, para compensar falhas de carregamento) — não
+                # gasta requisição resolvendo candidatas além do preciso.
+                faltam = max(quantidade - len(resolvidos), 0)
+                necessarios = max(faltam * 3, 3)
+                resolvidos.extend(await self._resolver_materias(cliente, novos[:necessarios]))
+
+            tempo_esgotado = (time.monotonic() - inicio) >= self._orcamento_segundos
+            if len(resolvidos) >= quantidade or tempo_esgotado:
+                break
+
+        return resolvidos, houve_candidato
+
+    async def _resolver_materias(
+        self, cliente: httpx.AsyncClient, candidatos: list[ItemNoticia]
+    ) -> list[tuple[ItemNoticia, MateriaG1, str]]:
+        """Busca cada matéria candidata em paralelo (com limite de
+        concorrência, para não sobrecarregar o G1) e descarta as que
+        falharam ao carregar ou ficaram sem texto para resumir."""
+        semaforo = asyncio.Semaphore(self._concorrencia_maxima)
+        brutos = await asyncio.gather(
+            *(self._materia_e_resumo_limitada(cliente, semaforo, item.url) for item in candidatos)
+        )
+        return [
+            (item, materia, resumo)
+            for item, (materia, resumo) in zip(candidatos, brutos)
+            if materia is not None and resumo
+        ]
+
+    def _formatar_resposta(
+        self,
+        tema: str,
+        quantidade: int,
+        selecionados: list[tuple[ItemNoticia, MateriaG1, str]],
+    ) -> str:
+        blocos = [f"Notícias do G1 sobre '{tema}', da mais recente para a mais antiga:\n"]
+        for indice, (item, materia, resumo) in enumerate(selecionados, start=1):
+            data_formatada = self._formatador_data.formatar(materia.publicado_em)
+            blocos.append(
+                f"{indice}. {item.titulo}\n"
+                f"Publicado em: {data_formatada}\n"
+                f"Resumo: {resumo}\n"
+                f"Link: {item.url}\n"
+            )
+        if len(selecionados) < quantidade:
+            blocos.append(
+                f"(Encontrei {len(selecionados)} notícia(s) sobre '{tema}' nas editorias "
+                "permitidas — não há mais cobertura disponível agora, mesmo depois de "
+                "vasculhar várias páginas.)"
+            )
         return "\n".join(blocos)
 
-    async def _itens_da_editoria(self, cliente: httpx.AsyncClient, editoria: Editoria) -> list[ItemNoticia]:
-        em_cache = self._cache.obter(editoria.chave)
+    async def _itens_da_pagina(
+        self, cliente: httpx.AsyncClient, editoria: Editoria, pagina: int
+    ) -> list[ItemNoticia]:
+        chave_cache = f"{editoria.chave}:{pagina}"
+        em_cache = self._cache.obter(chave_cache)
         if em_cache is not None:
             return em_cache
-        html_pagina = await self._cliente_http.buscar_html(cliente, editoria.url)
-        itens = self._extrator_listagem.extrair(html_pagina) if html_pagina else []
-        self._cache.guardar(editoria.chave, itens)
+        html_pagina = await self._cliente_http.buscar_html(cliente, editoria.url_da_pagina(pagina))
+        itens_brutos = self._extrator_listagem.extrair(html_pagina) if html_pagina else []
+        itens = [item for item in itens_brutos if editoria.pertence(item.url)]
+        self._cache.guardar(chave_cache, itens)
         return itens
 
-    async def _resumo_da_materia(self, cliente: httpx.AsyncClient, url: str) -> str:
+    async def _materia_e_resumo_limitada(
+        self, cliente: httpx.AsyncClient, semaforo: asyncio.Semaphore, url: str
+    ) -> tuple[Optional[MateriaG1], str]:
+        async with semaforo:
+            return await self._materia_e_resumo(cliente, url)
+
+    async def _materia_e_resumo(self, cliente: httpx.AsyncClient, url: str) -> tuple[Optional[MateriaG1], str]:
         html_pagina = await self._cliente_http.buscar_html(cliente, url)
         if not html_pagina:
-            return ""
+            return None, ""
         materia = self._extrator_materia.extrair(html_pagina)
         if materia is None:
-            return ""
-        return self._montador_resumo.montar(materia)
+            return None, ""
+        return materia, self._montador_resumo.montar(materia)
 
 
 # --- Composição (instâncias únicas usadas pelas tools) ---------------------
@@ -355,14 +540,18 @@ _buscador_noticias = BuscadorNoticiasG1(
     extrator_listagem=ExtratorListagemG1(_limpador_html),
     extrator_materia=ExtratorMateriaG1(_limpador_html),
     montador_resumo=MontadorResumo(limite_palavras=150),
+    formatador_data=FormatadorData(),
     cache=CacheListagem(ttl_segundos=600),
+    max_paginas=5,
+    orcamento_segundos=25.0,
+    concorrencia_maxima=8,
 )
 
 
 @mcp.tool(
     name="noticias_g1",
     annotations=ToolAnnotations(
-        title="Buscar notícias do G1 por tema",
+        title="Buscar as notícias mais recentes do G1 por tema",
         readOnlyHint=True,
         destructiveHint=False,
         idempotentHint=True,
@@ -370,12 +559,20 @@ _buscador_noticias = BuscadorNoticiasG1(
     ),
 )
 async def noticias_g1(tema: str, editoria: str = "", quantidade: int = 3) -> str:
-    """Busca notícias reais do G1 relacionadas a um tema, como fonte confiável para textos.
+    """Busca notícias reais e recentes do G1, como fonte confiável para pesquisa de fontes.
 
-    Varre as editorias autorizadas do G1 (ver a tool g1_listar_editorias)
-    procurando notícias cujo título ou chamada tenha relação com o tema
-    informado. Para cada notícia encontrada, acessa a matéria original e
-    monta um resumo de até 150 palavras.
+    Use esta tool sempre que precisar de notícias verdadeiras e verificáveis
+    do G1 sobre um assunto — por exemplo, antes de escrever um texto, para
+    citar uma fonte jornalística confiável em vez de arriscar uma informação
+    inventada ou desatualizada. Não use busca genérica na internet para esse
+    fim: esta tool já garante que o link devolvido é uma matéria real do G1.
+
+    A tool varre as editorias autorizadas do G1 (ver a tool
+    g1_listar_editorias), avançando página por página quando necessário até
+    reunir notícias suficientes, e ordena os resultados pela data de
+    publicação real — a mais recente primeiro. Ela sempre tenta devolver o
+    número de notícias pedido em `quantidade`; só devolve menos se não
+    existir cobertura suficiente sobre o tema nas editorias permitidas.
 
     Args:
         tema: Assunto a pesquisar (ex: "eleições", "inteligência artificial").
@@ -385,9 +582,10 @@ async def noticias_g1(tema: str, editoria: str = "", quantidade: int = 3) -> str
         quantidade: Quantas notícias retornar (padrão 3, máximo 10).
 
     Returns:
-        Texto com, para cada notícia: título, resumo de até 150 palavras e o
-        link obrigatório da matéria original, para a pessoa usuária conferir
-        a fonte na íntegra. Se nada for encontrado, explica isso em vez de
+        Texto com, para cada notícia, da mais recente para a mais antiga:
+        título, data de publicação, resumo de até 150 palavras e o link
+        obrigatório da matéria original, para a pessoa usuária conferir a
+        fonte na íntegra. Se nada for encontrado, explica isso em vez de
         inventar uma notícia.
     """
     return await _buscador_noticias.buscar(tema=tema, editoria=editoria, quantidade=quantidade)

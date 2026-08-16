@@ -50,12 +50,14 @@ Este MCP-Server tem duas tools:
 
 ### `noticias_g1` (Tool)
 
-Busca notícias do G1 relacionadas a um tema. A tool varre as editorias permitidas e devolve, para cada notícia encontrada, o título, um resumo de até 150 palavras e o link da matéria original.
+Busca notícias do G1 relacionadas a um tema. A tool varre as editorias permitidas e devolve, para cada notícia encontrada, o título, a data de publicação, um resumo de até 150 palavras e o link da matéria original — da mais recente para a mais antiga.
 
-* **Parâmetro obrigatório**: `tema`. Palavra ou frase a pesquisar nos títulos e nas chamadas das notícias (ex: "eleições", "inteligência artificial").
+* **Parâmetro obrigatório**: `tema`. Palavra ou frase a pesquisar nos títulos e nas chamadas das notícias (ex: "eleições", "inteligência artificial"). A tool amplia o tema em até 10 variações (plural, singular e radical de cada palavra), para não depender do termo exato.
 * **Parâmetro opcional**: `editoria`. Restringe a busca a uma única editoria (ex: `tecnologia`, `saude`). Em branco, a tool busca nas 16 editorias permitidas.
 * **Parâmetro opcional**: `quantidade`. Define quantas notícias retornar. O padrão é 3. O máximo é 10.
-* **Cache de 10 minutos**: a tool guarda a lista de cada editoria por 10 minutos, para não sobrecarregar o G1 a cada chamada.
+* **Busca em profundidade**: a tool sempre tenta entregar o número de notícias pedido. Se a primeira página de uma editoria não tiver candidatas suficientes, ela avança para as páginas seguintes (até 5 por editoria, ou até um limite de tempo de 25 segundos), em vez de parar cedo. Só devolve menos que o pedido se não existir cobertura suficiente sobre o tema.
+* **Guardrail de editoria**: só entram no resultado links que pertencem mesmo à editoria de onde foram coletados — páginas de listagem do G1 também têm blocos de "veja também" apontando para outras seções, e esses são descartados.
+* **Cache de 10 minutos**: a tool guarda cada página de cada editoria por 10 minutos, para não sobrecarregar o G1 a cada chamada.
 * **Sem notícia encontrada**: a tool devolve uma mensagem explicando isso, em vez de inventar uma notícia.
 
 ### `g1_listar_editorias` (Tool)
