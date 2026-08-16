@@ -18,6 +18,13 @@ mcp = FastMCP("G1-Noticias")
 
 _DATA_MUITO_ANTIGA = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
+# Guardrail de negócio, combinado com o Mário: esta tool nunca devolve mais
+# de 3 notícias numa única chamada, mesmo que o parâmetro `quantidade`
+# receba um valor maior. Ficou definido aqui, e não só na docstring, porque
+# a docstring é só uma instrução para o cliente MCP respeitar — quem
+# garante o limite de verdade é o código.
+MAXIMO_NOTICIAS_POR_CHAMADA = 3
+
 
 # --- Modelos -----------------------------------------------------------
 # Estruturas simples de dados (imutáveis) que trafegam entre as classes
@@ -385,7 +392,9 @@ class BuscadorNoticiasG1:
         tema = tema.strip()
         if not tema:
             return "Informe um tema para buscar notícias do G1 (ex: 'eleições', 'saúde mental')."
-        quantidade = max(1, min(quantidade, 10))
+        # Guardrail rígido: esta tool nunca devolve mais de MAXIMO_NOTICIAS_POR_CHAMADA
+        # notícias numa única chamada, mesmo que o cliente MCP peça um valor maior.
+        quantidade = max(1, min(quantidade, MAXIMO_NOTICIAS_POR_CHAMADA))
 
         if editoria.strip():
             alvo = self._registro_editorias.buscar(editoria)
@@ -574,12 +583,19 @@ async def noticias_g1(tema: str, editoria: str = "", quantidade: int = 3) -> str
     número de notícias pedido em `quantidade`; só devolve menos se não
     existir cobertura suficiente sobre o tema nas editorias permitidas.
 
+    Limite rígido: esta tool NUNCA devolve mais de 3 notícias numa única
+    chamada, mesmo que `quantidade` peça um valor maior — o servidor corta
+    o valor para 3 antes de buscar. Se o pedido da pessoa usuária precisar
+    de mais de 3 notícias, chame esta tool mais de uma vez (por exemplo,
+    uma vez por editoria ou por sub-tema) em vez de esperar um `quantidade`
+    maior.
+
     Args:
         tema: Assunto a pesquisar (ex: "eleições", "inteligência artificial").
         editoria: Chave de uma editoria específica para restringir a busca
             (ex: "tecnologia", "saude"). Deixe em branco para buscar nas 16
             editorias permitidas.
-        quantidade: Quantas notícias retornar (padrão 3, máximo 10).
+        quantidade: Quantas notícias retornar (padrão e máximo 3).
 
     Returns:
         Texto com, para cada notícia, da mais recente para a mais antiga:

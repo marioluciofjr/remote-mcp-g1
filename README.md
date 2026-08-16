@@ -34,6 +34,12 @@ O servidor usa o transporte Streamable HTTP e roda na nuvem, na Vercel, no URL `
 > [!IMPORTANT]
 > Esse URL só aceita pedidos `POST` e `DELETE`, no formato do protocolo MCP. Se você colar o URL no navegador, ele faz um pedido `GET` e mostra a mensagem "Method Not Allowed". Isso é esperado, não é um erro. Confirma só que o servidor está no ar. Use o URL dentro de um cliente MCP, não direto no navegador.
 
+> [!IMPORTANT]
+> Cada cliente MCP decide, por conta própria, quando chamar as tools deste servidor — essa decisão não é controlada por este projeto. Em teste real, o Claude reconheceu e chamou as tools do mcp-g1 mesmo sem citação direta ao app. Já o Gemini e o ChatGPT, às vezes, só chamam a tool se você citar o nome do app no prompt. Se a IA não usar o MCP mesmo com o app já conectado, cite o nome do app diretamente. Exemplo: `@G1 Quero fazer um texto sobre redações nota 1000 do Enem. Busque notícias no G1 sobre isso.`
+
+> [!NOTE]
+> Cada cliente formata a resposta da tool à sua própria maneira. Gemini, Claude e ChatGPT têm layouts diferentes para apresentar o mesmo conjunto de notícias — um pode usar tabela, outro lista, outro um resumo com mais contexto ao redor. Essa é uma reformatação do cliente em cima do texto que a tool devolveu, não uma diferença no conteúdo da busca. Em qualquer cliente, a tool `noticias_g1` nunca devolve mais de 3 notícias por chamada — esse limite é fixo no servidor, não depende do cliente respeitar um pedido de mais notícias.
+
 ## Sobre o G1
 
 O G1 é o portal de notícias do Grupo Globo. O Mário Lúcio desenvolveu este MCP de forma independente, como projeto de teste técnico. Este projeto não tem afiliação com a Globo Comunicação e Participações S.A., nem é endossado por ela.
@@ -54,7 +60,7 @@ Busca notícias do G1 relacionadas a um tema. A tool varre as editorias permitid
 
 * **Parâmetro obrigatório**: `tema`. Palavra ou frase a pesquisar nos títulos e nas chamadas das notícias (ex: "eleições", "inteligência artificial"). A tool amplia o tema em até 10 variações (plural, singular e radical de cada palavra), para não depender do termo exato.
 * **Parâmetro opcional**: `editoria`. Restringe a busca a uma única editoria (ex: `tecnologia`, `saude`). Em branco, a tool busca nas 16 editorias permitidas.
-* **Parâmetro opcional**: `quantidade`. Define quantas notícias retornar. O padrão é 3. O máximo é 10.
+* **Parâmetro opcional**: `quantidade`. Define quantas notícias retornar. O padrão e o máximo são 3 — esse limite é fixo no servidor. Mesmo que o cliente MCP peça um valor maior, a tool corta para 3 antes de buscar.
 * **Busca em profundidade**: a tool sempre tenta entregar o número de notícias pedido. Se a primeira página de uma editoria não tiver candidatas suficientes, ela avança para as páginas seguintes (até 5 por editoria, ou até um limite de tempo de 25 segundos), em vez de parar cedo. Só devolve menos que o pedido se não existir cobertura suficiente sobre o tema.
 * **Guardrail de editoria**: só entram no resultado links que pertencem mesmo à editoria de onde foram coletados — páginas de listagem do G1 também têm blocos de "veja também" apontando para outras seções, e esses são descartados.
 * **Cache de 10 minutos**: a tool guarda cada página de cada editoria por 10 minutos, para não sobrecarregar o G1 a cada chamada.
